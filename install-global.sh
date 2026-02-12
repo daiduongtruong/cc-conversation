@@ -3,11 +3,14 @@ set -euo pipefail
 
 # install-global.sh — Install conversation history tracking globally for all Claude Code projects.
 #
-# Usage:
-#   bash /path/to/ai-conversation-management/install-global.sh
+# Usage (one-liner, no clone needed):
+#   curl -sSL https://raw.githubusercontent.com/daiduongtruong/cc-conversation/master/install-global.sh | bash
+#
+# Usage (from cloned repo):
+#   bash install-global.sh
 #
 # What it does:
-#   1. Copies sync-conversation.py to ~/.claude/hooks/
+#   1. Installs sync-conversation.py to ~/.claude/hooks/
 #   2. Merges hook config into ~/.claude/settings.json (preserves existing settings)
 #   3. Appends conversation recovery instructions to ~/.claude/CLAUDE.md
 #
@@ -18,9 +21,11 @@ set -euo pipefail
 #   - Claude knows how to search history from the first message (via global CLAUDE.md)
 #
 # Safe to run multiple times (idempotent).
-# To uninstall: bash install-global.sh --uninstall
+# To uninstall:
+#   curl -sSL https://raw.githubusercontent.com/daiduongtruong/cc-conversation/master/install-global.sh | bash -s -- --uninstall
 
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+REPO_RAW="https://raw.githubusercontent.com/daiduongtruong/cc-conversation/master"
+SCRIPT_DIR="$(cd "$(dirname "$0")" 2>/dev/null && pwd 2>/dev/null)" || SCRIPT_DIR=""
 CLAUDE_HOME="$HOME/.claude"
 HOOKS_DIR="$CLAUDE_HOME/hooks"
 SETTINGS_FILE="$CLAUDE_HOME/settings.json"
@@ -84,10 +89,14 @@ echo "  Hook script:  $HOOKS_DIR/sync-conversation.py"
 echo "  Settings:     $SETTINGS_FILE"
 echo
 
-# 1. Copy hook script
+# 1. Install hook script (local copy or fetch from GitHub)
 echo "[1/3] Installing sync-conversation.py to ~/.claude/hooks/..."
 mkdir -p "$HOOKS_DIR"
-cp "$SCRIPT_DIR/sync-conversation.py" "$HOOKS_DIR/sync-conversation.py"
+if [ -n "$SCRIPT_DIR" ] && [ -f "$SCRIPT_DIR/sync-conversation.py" ]; then
+    cp "$SCRIPT_DIR/sync-conversation.py" "$HOOKS_DIR/sync-conversation.py"
+else
+    curl -sSL "$REPO_RAW/sync-conversation.py" -o "$HOOKS_DIR/sync-conversation.py"
+fi
 chmod +x "$HOOKS_DIR/sync-conversation.py"
 echo "  -> $HOOKS_DIR/sync-conversation.py"
 
@@ -221,4 +230,4 @@ echo "  - Every subsequent response syncs incrementally"
 echo "  - Each sync = a git commit (supports fork/revert)"
 echo
 echo "To uninstall:"
-echo "  bash $SCRIPT_DIR/install-global.sh --uninstall"
+echo "  curl -sSL $REPO_RAW/install-global.sh | bash -s -- --uninstall"
