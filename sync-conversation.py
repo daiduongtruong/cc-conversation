@@ -163,6 +163,13 @@ def extract_active_branch(jsonl_path):
                 else:
                     text_parts = []
 
+                # Skip compaction context-recovery messages
+                joined = "\n\n".join(text_parts)
+                if joined.lstrip().startswith(
+                    "This session is being continued from a previous conversation"
+                ):
+                    text_parts = []
+
                 if text_parts:
                     time_str = ""
                     if raw_timestamp:
