@@ -328,6 +328,74 @@ def git_commit(conv_dir, session_id, summary):
         pass  # Don't break the hook if git fails
 
 
+def sync_session(transcript_path, session_id, sessions_dir, state_dir, index_path):
+    """Process a single session JSONL into a markdown file.
+
+    Returns True if the session was updated, False if skipped.
+    """
+    # Check state: skip if file hasn't changed
+    state_file = state_dir / f"{session_id}.json"
+    prev_state = {}
+    if state_file.exists():
+        try:
+            prev_state = json.loads(state_file.read_text())
+        except (json.JSONDecodeError, IOError):
+            pass
+
+    current_file_size = transcript_path.stat().st_size
+    if prev_state.get("file_size") == current_file_size:
+        return False
+
+    # Extract active branch
+    messages, file_size, active_leaf = extract_active_branch(transcript_path)
+
+    if not messages:
+        state_file.write_text(
+            json.dumps({"file_size": file_size, "leaf_uuid": None})
+        )
+        return False
+
+    # Always write full .md file (active branch may have changed on rewind)
+    session_file = sessions_dir / f"{session_id}.md"
+    with open(session_file, "w") as f:
+        f.write(f"---\nsession_id: {session_id}\n")
+        f.write(f"started: {messages[0]['time'] or datetime.now().isoformat()}\n")
+        f.write(f"messages: {len(messages)}\n---\n\n")
+        f.write(format_messages(messages))
+
+    # Update state
+    state_file.write_text(
+        json.dumps({"file_size": file_size, "leaf_uuid": active_leaf})
+    )
+
+    # Update index
+    summary = get_first_human_message(transcript_path)
+    if summary:
+        update_index(index_path, session_id, summary)
+
+    return True
+
+
+def backfill_sessions(transcript_path, sessions_dir, state_dir, index_path, conv_dir):
+    """Process all existing session JSONLs in the same project directory.
+
+    Called on first run in a project to capture historical sessions.
+    """
+    project_jsonl_dir = transcript_path.parent
+    count = 0
+    for jsonl_file in sorted(project_jsonl_dir.glob("*.jsonl")):
+        if jsonl_file.name.startswith("agent-"):
+            continue
+        if jsonl_file.stat().st_size == 0:
+            continue
+        sid = jsonl_file.stem
+        if sync_session(jsonl_file, sid, sessions_dir, state_dir, index_path):
+            count += 1
+
+    if count > 0:
+        git_commit(conv_dir, "backfill", f"Backfill {count} historical sessions")
+
+
 def main():
     # Read hook input from stdin
     try:
@@ -352,54 +420,22 @@ def main():
     session_id = hook_input.get("session_id", transcript_path.stem)
 
     # Auto-setup on first run in this project
+    first_run = not (conv_dir / ".git").exists()
     ensure_project_setup(project_root)
 
-    # Check state: skip if file hasn't changed
-    state_file = state_dir / f"{session_id}.json"
-    prev_state = {}
-    if state_file.exists():
-        try:
-            prev_state = json.loads(state_file.read_text())
-        except (json.JSONDecodeError, IOError):
-            pass
-
-    current_file_size = transcript_path.stat().st_size
-    if prev_state.get("file_size") == current_file_size:
-        # JSONL unchanged since last run — nothing to do
-        print(json.dumps({"suppressOutput": True}))
-        return
-
-    # Extract active branch
-    messages, file_size, active_leaf = extract_active_branch(transcript_path)
-
-    if not messages:
-        # No conversation text on active branch
-        # Still update state to avoid re-processing
-        state_file.write_text(
-            json.dumps({"file_size": file_size, "leaf_uuid": None})
+    # On first run, backfill all existing sessions from this project
+    if first_run:
+        backfill_sessions(
+            transcript_path, sessions_dir, state_dir, index_path, conv_dir
         )
-        print(json.dumps({"suppressOutput": True}))
-        return
 
-    # Always write full .md file (active branch may have changed on rewind)
-    session_file = sessions_dir / f"{session_id}.md"
-    with open(session_file, "w") as f:
-        f.write(f"---\nsession_id: {session_id}\n")
-        f.write(f"started: {messages[0]['time'] or datetime.now().isoformat()}\n")
-        f.write(f"messages: {len(messages)}\n---\n\n")
-        f.write(format_messages(messages))
-
-    # Update state
-    state_file.write_text(
-        json.dumps({"file_size": file_size, "leaf_uuid": active_leaf})
-    )
-
-    # Update index
-    summary = get_first_human_message(transcript_path)
-    if summary:
-        update_index(index_path, session_id, summary)
-        # Git commit (each sync = a revertable checkpoint)
-        git_commit(conv_dir, session_id, summary)
+    # Process the current session
+    if sync_session(
+        transcript_path, session_id, sessions_dir, state_dir, index_path
+    ):
+        summary = get_first_human_message(transcript_path)
+        if summary:
+            git_commit(conv_dir, session_id, summary)
 
     # Suppress output — don't inject sync info into Claude's context
     print(json.dumps({"suppressOutput": True}))
