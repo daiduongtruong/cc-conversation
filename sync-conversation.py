@@ -103,7 +103,9 @@ def extract_active_branch(jsonl_path):
     concatenates them in chronological order, giving the full conversation
     history that survives compaction.
 
-    Returns (messages, file_size, active_leaf_uuid).
+    Returns (messages, file_size, active_leaf_uuid, first_ts, last_ts, orphan_parents).
+    first_ts/last_ts are raw ISO timestamp strings.
+    orphan_parents: list of parentUuids not found within this session (cross-session links).
     """
     file_size = jsonl_path.stat().st_size
 
@@ -129,6 +131,7 @@ def extract_active_branch(jsonl_path):
             entry_type = entry.get("type", "")
             parent_uuid = entry.get("parentUuid", "")
             is_sidechain = entry.get("isSidechain", False)
+            raw_timestamp = entry.get("timestamp", "")
 
             # Extract text data for user/assistant entries
             text_data = None
@@ -151,16 +154,15 @@ def extract_active_branch(jsonl_path):
                     text_parts = []
 
                 if text_parts:
-                    timestamp = entry.get("timestamp", "")
                     time_str = ""
-                    if timestamp:
+                    if raw_timestamp:
                         try:
                             dt = datetime.fromisoformat(
-                                timestamp.replace("Z", "+00:00")
+                                raw_timestamp.replace("Z", "+00:00")
                             )
                             time_str = dt.strftime("%Y-%m-%d %H:%M:%S")
                         except (ValueError, AttributeError):
-                            time_str = timestamp[:19]
+                            time_str = raw_timestamp[:19]
 
                     text_data = {
                         "role": entry_type.capitalize(),
@@ -174,13 +176,24 @@ def extract_active_branch(jsonl_path):
                 "line": line_num,
                 "isSidechain": is_sidechain,
                 "text_data": text_data,
+                "timestamp": raw_timestamp,
             }
 
             if parent_uuid:
                 children[parent_uuid].append(uuid)
 
     if not entries:
-        return [], file_size, None
+        return [], file_size, None, None, None, []
+
+    # Find orphan parentUuids (cross-session references from claude -c)
+    all_uuids = set(entries.keys())
+    orphan_parents = [
+        entries[u]["parentUuid"]
+        for u in entries
+        if entries[u]["parentUuid"]
+        and entries[u]["parentUuid"] not in all_uuids
+        and not entries[u]["isSidechain"]
+    ]
 
     # Find non-sidechain leaves
     leaves = [
@@ -191,7 +204,7 @@ def extract_active_branch(jsonl_path):
     if not leaves:
         leaves = [u for u in entries if u not in children]
     if not leaves:
-        return [], file_size, None
+        return [], file_size, None, None, None, orphan_parents
 
     # Trace each leaf to its root to group leaves by subtree
     leaf_to_root = {}
@@ -216,6 +229,7 @@ def extract_active_branch(jsonl_path):
 
     all_messages = []
     overall_active_leaf = None
+    branch_timestamps = []
 
     for root in sorted_roots:
         root_leaves = root_to_leaves[root]
@@ -231,15 +245,21 @@ def extract_active_branch(jsonl_path):
             current = entries[current]["parentUuid"]
         path_uuids.reverse()
 
-        # Extract text messages on this branch
+        # Extract text messages and timestamps on this branch
         for uuid in path_uuids:
             td = entries[uuid]["text_data"]
             if td:
                 all_messages.append(td)
+            ts = entries[uuid]["timestamp"]
+            if ts:
+                branch_timestamps.append(ts)
 
         overall_active_leaf = active_leaf
 
-    return all_messages, file_size, overall_active_leaf
+    first_ts = branch_timestamps[0] if branch_timestamps else None
+    last_ts = branch_timestamps[-1] if branch_timestamps else None
+
+    return all_messages, file_size, overall_active_leaf, first_ts, last_ts, orphan_parents
 
 
 def format_messages(messages):
@@ -278,28 +298,149 @@ def get_first_human_message(jsonl_path):
     return None
 
 
-def update_index(index_path, session_id, summary):
-    """Update index.md with session entry."""
-    entries = {}
+def detect_chains(state_dir, transcript_dir):
+    """Detect session chains via cross-session parentUuid references.
 
-    if index_path.exists():
-        with open(index_path, "r") as f:
+    When `claude -c` continues a session, it creates entries with parentUuid
+    referencing messages from the previous session. These orphan parentUuids
+    (not found within the same session) are the cross-session links.
+
+    Returns {session_id: continues_session_id} for sessions that continue another.
+    """
+    # Collect orphan_parents from state files
+    session_orphans = {}
+    for state_file in state_dir.glob("*.json"):
+        try:
+            state = json.loads(state_file.read_text())
+            sid = state_file.stem
+            orphans = state.get("orphan_parents", [])
+            if orphans:
+                session_orphans[sid] = orphans
+        except (json.JSONDecodeError, IOError):
+            continue
+
+    if not session_orphans:
+        return {}
+
+    # Collect all target orphan uuids we need to find
+    all_orphans = {}  # {orphan_uuid: session_that_needs_it}
+    for sid, orphans in session_orphans.items():
+        for orphan in orphans:
+            all_orphans[orphan] = sid
+
+    # Scan JSONL files to find which session contains each orphan uuid
+    continues = {}
+    remaining = set(all_orphans.keys())
+
+    for jsonl_file in sorted(transcript_dir.glob("*.jsonl")):
+        if not remaining:
+            break
+        if jsonl_file.stat().st_size == 0:
+            continue
+        source_sid = jsonl_file.stem
+
+        with open(jsonl_file, "r") as f:
             for line in f:
-                line = line.rstrip()
-                if line.startswith("- **"):
-                    try:
-                        sid = line.split("**")[1]
-                        entries[sid] = line
-                    except IndexError:
-                        pass
+                try:
+                    entry = json.loads(line.strip())
+                    uuid = entry.get("uuid", "")
+                    if uuid in remaining:
+                        child_sid = all_orphans[uuid]
+                        if child_sid != source_sid:
+                            continues[child_sid] = source_sid
+                        remaining.discard(uuid)
+                except json.JSONDecodeError:
+                    continue
 
-    date_str = datetime.now().strftime("%Y-%m-%d %H:%M")
-    entries[session_id] = f"- **{session_id}** ({date_str}) — {summary}"
+    return continues
+
+
+def build_chains(continues):
+    """Build ordered chains from the continues map.
+
+    Returns list of chains, each chain is a list of session_ids in order.
+    Standalone sessions (not in any chain) are returned as single-element chains.
+    """
+    # Find chain heads (sessions that continue nothing or whose parent isn't continued)
+    all_sessions = set(continues.keys()) | set(continues.values())
+    continued_by = {}  # reverse map: prev_sid → next_sid
+    for sid, prev_sid in continues.items():
+        continued_by[prev_sid] = sid
+
+    # Find heads: sessions that are not a continuation of anything
+    heads = [sid for sid in all_sessions if sid not in continues]
+
+    chains = []
+    seen = set()
+    for head in sorted(heads):
+        chain = [head]
+        seen.add(head)
+        current = head
+        while current in continued_by:
+            current = continued_by[current]
+            chain.append(current)
+            seen.add(current)
+        chains.append(chain)
+
+    return chains
+
+
+def update_index(index_path, state_dir, session_summaries, transcript_dir):
+    """Rewrite index.md with chain-grouped session entries.
+
+    session_summaries: {session_id: (date_str, summary)}
+    """
+    chains_map = detect_chains(state_dir, transcript_dir)
+    chains = build_chains(chains_map)
+
+    # Sessions in chains
+    chained_sids = set()
+    for chain in chains:
+        if len(chain) > 1:
+            for sid in chain:
+                chained_sids.add(sid)
+
+    # Standalone sessions (not part of any multi-session chain)
+    standalone = [
+        sid for sid in session_summaries if sid not in chained_sids
+    ]
 
     with open(index_path, "w") as f:
         f.write("# Conversation Index\n\n")
-        for entry in entries.values():
-            f.write(entry + "\n")
+
+        # Write chains first
+        for chain in chains:
+            if len(chain) < 2:
+                continue
+            first_sid = chain[0]
+            first_summary = session_summaries.get(first_sid)
+            if first_summary:
+                f.write(f"## Chain: {first_summary[1][:60]}\n")
+            else:
+                f.write(f"## Chain: {first_sid[:8]}\n")
+
+            for i, sid in enumerate(chain):
+                entry = session_summaries.get(sid)
+                if not entry:
+                    continue
+                date_str, summary = entry
+                if i == 0:
+                    f.write(f"- **{sid}** ({date_str}) — {summary}\n")
+                else:
+                    f.write(
+                        f"- **{sid}** ({date_str}) → continues {chain[i-1][:8]}\n"
+                    )
+            f.write("\n")
+
+        # Write standalone sessions
+        if standalone:
+            if chained_sids:
+                f.write("## Standalone\n")
+            for sid in sorted(standalone):
+                entry = session_summaries.get(sid)
+                if entry:
+                    date_str, summary = entry
+                    f.write(f"- **{sid}** ({date_str}) — {summary}\n")
 
 
 def git_commit(conv_dir, session_id, summary):
@@ -347,7 +488,9 @@ def sync_session(transcript_path, session_id, sessions_dir, state_dir, index_pat
         return False
 
     # Extract active branch
-    messages, file_size, active_leaf = extract_active_branch(transcript_path)
+    messages, file_size, active_leaf, first_ts, last_ts, orphan_parents = (
+        extract_active_branch(transcript_path)
+    )
 
     if not messages:
         state_file.write_text(
@@ -363,17 +506,59 @@ def sync_session(transcript_path, session_id, sessions_dir, state_dir, index_pat
         f.write(f"messages: {len(messages)}\n---\n\n")
         f.write(format_messages(messages))
 
-    # Update state
+    # Update state (include orphan_parents for chain detection)
     state_file.write_text(
-        json.dumps({"file_size": file_size, "leaf_uuid": active_leaf})
+        json.dumps({
+            "file_size": file_size,
+            "leaf_uuid": active_leaf,
+            "first_ts": first_ts,
+            "last_ts": last_ts,
+            "orphan_parents": orphan_parents,
+        })
     )
 
-    # Update index
-    summary = get_first_human_message(transcript_path)
-    if summary:
-        update_index(index_path, session_id, summary)
-
     return True
+
+
+def collect_summaries(state_dir, transcript_dir):
+    """Collect session summaries for index rebuild.
+
+    Returns {session_id: (date_str, summary)}.
+    """
+    summaries = {}
+    for state_file in state_dir.glob("*.json"):
+        sid = state_file.stem
+        try:
+            state = json.loads(state_file.read_text())
+        except (json.JSONDecodeError, IOError):
+            continue
+        # Get date from first_ts
+        first_ts = state.get("first_ts", "")
+        date_str = ""
+        if first_ts:
+            try:
+                dt = datetime.fromisoformat(first_ts.replace("Z", "+00:00"))
+                date_str = dt.strftime("%Y-%m-%d %H:%M")
+            except (ValueError, AttributeError):
+                date_str = first_ts[:16]
+        if not date_str:
+            date_str = datetime.now().strftime("%Y-%m-%d %H:%M")
+        # Get summary from JSONL
+        jsonl_path = transcript_dir / f"{sid}.jsonl"
+        summary = None
+        if jsonl_path.exists():
+            summary = get_first_human_message(jsonl_path)
+        if not summary:
+            summary = "[no summary]"
+        summaries[sid] = (date_str, summary)
+    return summaries
+
+
+def rebuild_index(state_dir, index_path, transcript_dir):
+    """Rebuild index.md with chain detection."""
+    summaries = collect_summaries(state_dir, transcript_dir)
+    if summaries:
+        update_index(index_path, state_dir, summaries, transcript_dir)
 
 
 def backfill_sessions(transcript_path, sessions_dir, state_dir, index_path, conv_dir):
@@ -392,7 +577,9 @@ def backfill_sessions(transcript_path, sessions_dir, state_dir, index_path, conv
         if sync_session(jsonl_file, sid, sessions_dir, state_dir, index_path):
             count += 1
 
+    # Rebuild index with chain detection after all sessions are synced
     if count > 0:
+        rebuild_index(state_dir, index_path, transcript_path.parent)
         git_commit(conv_dir, "backfill", f"Backfill {count} historical sessions")
 
 
@@ -433,6 +620,7 @@ def main():
     if sync_session(
         transcript_path, session_id, sessions_dir, state_dir, index_path
     ):
+        rebuild_index(state_dir, index_path, transcript_path.parent)
         summary = get_first_human_message(transcript_path)
         if summary:
             git_commit(conv_dir, session_id, summary)
