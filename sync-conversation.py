@@ -4,7 +4,8 @@ sync-conversation.py — Maintain search-friendly conversation transcripts.
 
 Triggered by Claude Code hooks (Stop, PreCompact).
 Reads the session JSONL, extracts human/assistant text (no tool blocks),
-writes grep-friendly markdown to .conversations/sessions/<session-id>.md.
+writes grep-friendly markdown to .conversations/sessions/.
+Chained sessions (from claude -c) are merged into a single file per chain.
 
 Uses tree-walking to follow only the active branch of the conversation,
 correctly handling rewinds (where abandoned branches remain in the JSONL).
@@ -40,20 +41,29 @@ def ensure_project_setup(project_root):
     """Auto-setup .conversations/ on first run in a project."""
     conv_dir = project_root / ".conversations"
     sessions_dir = conv_dir / "sessions"
+    parts_dir = conv_dir / ".parts"
     state_dir = conv_dir / ".state"
     index_path = conv_dir / "index.md"
 
     # Create directory structure
     sessions_dir.mkdir(parents=True, exist_ok=True)
+    parts_dir.mkdir(parents=True, exist_ok=True)
     state_dir.mkdir(parents=True, exist_ok=True)
 
-    # Add .state/ to .gitignore (implementation detail, not conversation content)
+    # Add internal dirs to .gitignore
     gitignore = conv_dir / ".gitignore"
+    needed = [".state/", ".parts/"]
     if not gitignore.exists():
-        gitignore.write_text(".state/\n")
-    elif ".state/" not in gitignore.read_text():
-        with open(gitignore, "a") as f:
-            f.write(".state/\n")
+        gitignore.write_text("\n".join(needed) + "\n")
+    else:
+        content = gitignore.read_text()
+        added = False
+        for entry in needed:
+            if entry not in content:
+                content += entry + "\n"
+                added = True
+        if added:
+            gitignore.write_text(content)
 
     # Initialize git repo
     if not (conv_dir / ".git").exists():
@@ -385,6 +395,124 @@ def build_chains(continues):
     return chains
 
 
+def generate_session_files(chains_map, parts_dir, sessions_dir, state_dir):
+    """Build searchable sessions/ from .parts/ files and chain info.
+
+    - Chains: concatenated into sessions/chain-<head-id>.md
+    - Standalone: copied as sessions/<session-id>.md
+    """
+    chains = build_chains(chains_map)
+
+    # Sessions in multi-session chains
+    chained_sids = set()
+    for chain in chains:
+        if len(chain) > 1:
+            for sid in chain:
+                chained_sids.add(sid)
+
+    # All sessions with parts
+    all_sids = {f.stem for f in parts_dir.glob("*.md")}
+
+    # Clean sessions/ — remove stale files
+    for existing in sessions_dir.glob("*.md"):
+        existing.unlink()
+
+    # Write chain files
+    for chain in chains:
+        if len(chain) < 2:
+            continue
+
+        head_sid = chain[0]
+        chain_file = sessions_dir / f"chain-{head_sid[:8]}.md"
+
+        # Get chain metadata from state
+        total_messages = 0
+        started = ""
+        for sid in chain:
+            state_file = state_dir / f"{sid}.json"
+            if state_file.exists():
+                try:
+                    state = json.loads(state_file.read_text())
+                    first_ts = state.get("first_ts", "")
+                    if first_ts and not started:
+                        try:
+                            dt = datetime.fromisoformat(
+                                first_ts.replace("Z", "+00:00")
+                            )
+                            started = dt.strftime("%Y-%m-%d %H:%M:%S")
+                        except (ValueError, AttributeError):
+                            started = first_ts[:19]
+                except (json.JSONDecodeError, IOError):
+                    pass
+
+        with open(chain_file, "w") as f:
+            f.write(f"---\nchain: {json.dumps(chain)}\n")
+            f.write(f"sessions: {len(chain)}\n")
+            if started:
+                f.write(f"started: {started}\n")
+            f.write("---\n\n")
+
+            for i, sid in enumerate(chain):
+                part_file = parts_dir / f"{sid}.md"
+                if not part_file.exists():
+                    continue
+
+                # Session header
+                session_date = ""
+                state_file = state_dir / f"{sid}.json"
+                if state_file.exists():
+                    try:
+                        state = json.loads(state_file.read_text())
+                        first_ts = state.get("first_ts", "")
+                        if first_ts:
+                            try:
+                                dt = datetime.fromisoformat(
+                                    first_ts.replace("Z", "+00:00")
+                                )
+                                session_date = dt.strftime("%Y-%m-%d %H:%M")
+                            except (ValueError, AttributeError):
+                                session_date = first_ts[:16]
+                    except (json.JSONDecodeError, IOError):
+                        pass
+
+                if i > 0:
+                    f.write("\n---\n\n")
+                f.write(f"# Session {sid[:8]} ({session_date})\n\n")
+                f.write(part_file.read_text())
+
+    # Write standalone files
+    for sid in all_sids:
+        if sid in chained_sids:
+            continue
+        part_file = parts_dir / f"{sid}.md"
+        session_file = sessions_dir / f"{sid}.md"
+
+        # Add frontmatter
+        session_date = ""
+        state_file = state_dir / f"{sid}.json"
+        if state_file.exists():
+            try:
+                state = json.loads(state_file.read_text())
+                first_ts = state.get("first_ts", "")
+                if first_ts:
+                    try:
+                        dt = datetime.fromisoformat(
+                            first_ts.replace("Z", "+00:00")
+                        )
+                        session_date = dt.strftime("%Y-%m-%d %H:%M:%S")
+                    except (ValueError, AttributeError):
+                        session_date = first_ts[:19]
+            except (json.JSONDecodeError, IOError):
+                pass
+
+        with open(session_file, "w") as f:
+            f.write(f"---\nsession_id: {sid}\n")
+            if session_date:
+                f.write(f"started: {session_date}\n")
+            f.write("---\n\n")
+            f.write(part_file.read_text())
+
+
 def update_index(index_path, state_dir, session_summaries, transcript_dir):
     """Rewrite index.md with chain-grouped session entries.
 
@@ -469,8 +597,11 @@ def git_commit(conv_dir, session_id, summary):
         pass  # Don't break the hook if git fails
 
 
-def sync_session(transcript_path, session_id, sessions_dir, state_dir, index_path):
-    """Process a single session JSONL into a markdown file.
+def sync_session(transcript_path, session_id, parts_dir, state_dir):
+    """Process a single session JSONL into a part markdown file.
+
+    Writes to .parts/<session_id>.md (internal). The searchable sessions/
+    directory is built later by generate_session_files().
 
     Returns True if the session was updated, False if skipped.
     """
@@ -498,12 +629,9 @@ def sync_session(transcript_path, session_id, sessions_dir, state_dir, index_pat
         )
         return False
 
-    # Always write full .md file (active branch may have changed on rewind)
-    session_file = sessions_dir / f"{session_id}.md"
-    with open(session_file, "w") as f:
-        f.write(f"---\nsession_id: {session_id}\n")
-        f.write(f"started: {messages[0]['time'] or datetime.now().isoformat()}\n")
-        f.write(f"messages: {len(messages)}\n---\n\n")
+    # Write individual part .md file
+    part_file = parts_dir / f"{session_id}.md"
+    with open(part_file, "w") as f:
         f.write(format_messages(messages))
 
     # Update state (include orphan_parents for chain detection)
@@ -554,14 +682,20 @@ def collect_summaries(state_dir, transcript_dir):
     return summaries
 
 
-def rebuild_index(state_dir, index_path, transcript_dir):
-    """Rebuild index.md with chain detection."""
+def rebuild_index(state_dir, index_path, transcript_dir, parts_dir, sessions_dir):
+    """Rebuild index.md, detect chains, and generate searchable session files."""
     summaries = collect_summaries(state_dir, transcript_dir)
-    if summaries:
-        update_index(index_path, state_dir, summaries, transcript_dir)
+    if not summaries:
+        return
+
+    chains_map = detect_chains(state_dir, transcript_dir)
+    generate_session_files(chains_map, parts_dir, sessions_dir, state_dir)
+    update_index(index_path, state_dir, summaries, transcript_dir)
 
 
-def backfill_sessions(transcript_path, sessions_dir, state_dir, index_path, conv_dir):
+def backfill_sessions(
+    transcript_path, parts_dir, sessions_dir, state_dir, index_path, conv_dir
+):
     """Process all existing session JSONLs in the same project directory.
 
     Called on first run in a project to capture historical sessions.
@@ -574,12 +708,14 @@ def backfill_sessions(transcript_path, sessions_dir, state_dir, index_path, conv
         if jsonl_file.stat().st_size == 0:
             continue
         sid = jsonl_file.stem
-        if sync_session(jsonl_file, sid, sessions_dir, state_dir, index_path):
+        if sync_session(jsonl_file, sid, parts_dir, state_dir):
             count += 1
 
     # Rebuild index with chain detection after all sessions are synced
     if count > 0:
-        rebuild_index(state_dir, index_path, transcript_path.parent)
+        rebuild_index(
+            state_dir, index_path, transcript_path.parent, parts_dir, sessions_dir
+        )
         git_commit(conv_dir, "backfill", f"Backfill {count} historical sessions")
 
 
@@ -595,6 +731,7 @@ def main():
     project_root = get_project_root(hook_input)
     conv_dir = project_root / ".conversations"
     sessions_dir = conv_dir / "sessions"
+    parts_dir = conv_dir / ".parts"
     state_dir = conv_dir / ".state"
     index_path = conv_dir / "index.md"
 
@@ -613,14 +750,14 @@ def main():
     # On first run, backfill all existing sessions from this project
     if first_run:
         backfill_sessions(
-            transcript_path, sessions_dir, state_dir, index_path, conv_dir
+            transcript_path, parts_dir, sessions_dir, state_dir, index_path, conv_dir
         )
 
     # Process the current session
-    if sync_session(
-        transcript_path, session_id, sessions_dir, state_dir, index_path
-    ):
-        rebuild_index(state_dir, index_path, transcript_path.parent)
+    if sync_session(transcript_path, session_id, parts_dir, state_dir):
+        rebuild_index(
+            state_dir, index_path, transcript_path.parent, parts_dir, sessions_dir
+        )
         summary = get_first_human_message(transcript_path)
         if summary:
             git_commit(conv_dir, session_id, summary)
