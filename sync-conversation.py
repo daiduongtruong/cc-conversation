@@ -660,6 +660,9 @@ def collect_summaries(state_dir, transcript_dir):
             state = json.loads(state_file.read_text())
         except (json.JSONDecodeError, IOError):
             continue
+        # Skip sessions with no extracted messages
+        if not state.get("leaf_uuid"):
+            continue
         # Get date from first_ts
         first_ts = state.get("first_ts", "")
         date_str = ""
