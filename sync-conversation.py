@@ -422,7 +422,7 @@ def generate_session_files(chains_map, parts_dir, sessions_dir, state_dir):
 
     # Clean sessions/ — remove stale files
     for existing in sessions_dir.glob("*.md"):
-        existing.unlink()
+        existing.unlink(missing_ok=True)
 
     # Write chain files
     for chain in chains:
